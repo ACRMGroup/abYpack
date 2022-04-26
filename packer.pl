@@ -1,12 +1,13 @@
 #!/usr/bin/perl -s
 #*************************************************************************
 #
-#   Program:    abYpack
-#   File:       abypack.pl
+#   Program:    abYmod
+#   File:       packer.pl
 #   
 #   Version:    V1.0
 #   Date:       14.03.22
-#   Function:   Build an antibody model from a specified set of templates
+#   Function:   Pack chains together at required packing angle based on
+#               the best template
 #   
 #   Copyright:  (c) UCL, Prof. Andrew C. R. Martin, 2022
 #   Author:     Prof. Andrew C. R. Martin
@@ -58,7 +59,8 @@ use config;
 use util;
 #use abymod;
 
-UsageDie() if(defined($::h) || (scalar(@ARGV) != 1) || (!defined($::angle) && !defined($::a)));
+UsageDie() if(defined($::h) || (scalar(@ARGV) != 1) ||
+              (!defined($::angle) && !defined($::a)));
 
 $::angle = $::a if(defined($::a));
 
@@ -68,17 +70,14 @@ my $pdbFile       = shift(@ARGV);
 my $referenceFile = '';
 my $tmpDir        = util::CreateTempDir("abYpack");
 util::Die("Cannot create temp directory") if($tmpDir eq '');
+$::q = 1;
 
 # Actual run
-$referenceFile = FindReferenceFile($angle);
-print STDERR "Reference file: $referenceFile\n\n"   if($::v >= 1);
-print STDERR "Fitting Light and Heavy chains to reference..." if($::v >= 1);
-my $model = FitChainsToReference($tmpDir, $pdbFile, $referenceFile);
-print STDERR "done\n" if($::v >= 1);
+my $model = RunPacker($tmpDir, $pdbFile, $angle);
 system("cat $model");
 
 # Cleanup
-#unlink($tmpDir);
+unlink($tmpDir);
 
 #*************************************************************************
 #> $referenceFile = FindReferenceFile($angle)
@@ -90,12 +89,43 @@ system("cat $model");
 #
 #  29.11.16  Original   By: ZCL
 #  30.11.16  Tidied up  By: ACRM
-sub FindReferenceFile
+sub RunPacker
 {
-    my($angle) = @_;
-    my $referenceFile  = '';
-    my $referenceAngle = -9999;
-    my $foundFile      = 0;
+    my($tmpDir, $pdbFile, $angle) = @_;
+    my $bestError   = 1000.0;
+    my $bestModel   = '';
+    my $modelNumber = 1;
+
+    # Set a range of angles in the library files. This exploits the
+    # roughly normal distribution to use smaller ranges when we are
+    # close to the peak of the distribution
+    my $range = 0.2;
+    if(($angle < -55) || ($angle > -35))
+    {
+        $range = 7;
+    }
+    elsif(($angle < -57) || ($angle > -37))
+    {
+        $range = 5;
+    }
+    elsif(($angle < -50) || ($angle > -40))
+    {
+        $range = 2;
+    }
+    elsif(($angle <= -49) || ($angle > -42))
+    {
+        $range = 1;
+    }
+    elsif(($angle < -48) || ($angle > -44))
+    {
+        $range = 0.5;
+    }
+
+    my($light, $heavy) = SplitPDB($tmpDir, $pdbFile);
+    if(($light eq '') || ($heavy eq ''))
+    {
+        util::Die("Could not split PDB file into light and heavy chains\n");
+    }
 
     if(open(my $fh, '<', $config::angleList))
     {
@@ -106,11 +136,19 @@ sub FindReferenceFile
             $row =~ s/^\s+//;   # Remove leading whitespace
             if(length($row))
             {
-                ($referenceAngle, $referenceFile) = split(/\s+/, $row);
-                if($angle <= $referenceAngle) 
+                my($referenceAngle, $referenceFile) = split(/\s+/, $row);
+                if(abs($referenceAngle - $angle) < $range)
                 {
-                    $foundFile = 1;
-                    last;
+                    my $model = FitChainsToReference($tmpDir, $light, $heavy,
+                                                     $referenceFile, $modelNumber);
+                    my $modelAngle = CalcModelAngle($model);
+                    my $error = abs($modelAngle - $angle);
+                    if($error < $bestError)
+                    {
+                        $bestError = $error;
+                        $bestModel = $model;
+                    }
+                    $modelNumber++;
                 }
             }
         }
@@ -121,12 +159,32 @@ sub FindReferenceFile
         util::Die("Could not open reference file with packing angles and filenames: '$config::angleList'\n");
     }
 
-    $referenceFile = '' if(!$foundFile);
-    return ($referenceFile);
+    return($bestModel);
 }
 
 #*************************************************************************
-#> $model = FitChainsToReference($tmpDir, $pdbFile, $referenceFile)
+#my $modelAngle = CalcModelAngle($model);
+sub CalcModelAngle
+{
+    my($model) = @_;
+    my $exe = "abpackingangle -q $model";
+    my $angle = util::RunCommand($exe);
+}
+
+
+#*************************************************************************
+# my($light, $heavy) = SplitPDB($tmpDir, $pdbFile))
+sub SplitPDB
+{
+    my($tmpDir, $pdbFile) = @_;
+    my $light   = GetChain($pdbFile, 'L', $tmpDir);
+    my $heavy   = GetChain($pdbFile, 'H', $tmpDir);
+    return($light, $heavy);
+}
+
+#*************************************************************************
+#> $model = FitChainsToReference($tmpDir, $light, $heavy, $referenceFile,
+#                                $modelNumber)
 #  -------------------------------------------------------------
 #  Inputs:   string   $tmpDir          Temporary working directory 
 #                                      (already created)
@@ -138,14 +196,12 @@ sub FindReferenceFile
 #
 #  Fits the light and heavy chains together using external program.
 #
-#  14.0322   Original based on abYmod  By: ACRM
+#  14.03.22   Original based on abYmod  By: ACRM
 sub FitChainsToReference
 {
-    my($tmpDir, $pdbFile, $referenceFile) = @_;
+    my($tmpDir, $light, $heavy, $referenceFile, $modelNumber) = @_;
     
-    my $light   = GetChain($pdbFile, 'L', $tmpDir);
-    my $heavy   = GetChain($pdbFile, 'H', $tmpDir);
-    my $outfile = "$tmpDir/model.pdb";
+    my $outfile = "$tmpDir/model_$modelNumber.pdb";
 
     $referenceFile = "$config::abpdblib/$referenceFile";
 
@@ -183,9 +239,14 @@ sub UsageDie
 {
     print STDERR <<__EOF;
 
-abYpack V1.0 (c) 2020, UCL, Prof. Andrew C.R. Martin
+packer V1.0 (c) 2020, UCL, Prof. Andrew C.R. Martin
 
-Usage: ./abypack.pl angle in.pdb > out.pdb
+Usage: ./packer.pl [-v=nnn] -angle=angle in.pdb > out.pdb
+       -v verbose mode
+       -angle|-a  - specify the angle REQUIRED!
+
+Packs an antibody VH/VL to (approximately) the required packing angle
+by fitting light and heavy chains to a template    
 
 __EOF
 
