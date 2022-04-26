@@ -446,7 +446,7 @@ sub RunCommand
     my ($exe, $useSystem) = @_;
     my $result = '';
 
-    print STDERR "$exe\n";
+    print STDERR "$exe\n" if(!defined($::q));
     if(defined($useSystem) && $useSystem)
     {
         system("$exe");
